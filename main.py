@@ -1,3 +1,4 @@
+print("MAIN.PY STARTED")
 import os
 import requests
 import pandas as pd
@@ -133,18 +134,33 @@ def extract_video_data(video_ids):
 
 
 def save_data(extracted_data):
-    df = pd.DataFrame (extracted_data)
-    df.to_csv(r"C:\Users\gargm\OneDrive\Desktop\Python\Youtube\test.csv",index=False)
+    df = pd.DataFrame(extracted_data)
+
+    csv_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "test.csv"
+    )
+
+    df.to_csv(csv_path, index=False)
+    print(f"CSV saved successfully: {csv_path}")
 
 def read_data():
-    csv_path = r"C:\Users\gargm\OneDrive\Desktop\Python\Youtube\test.csv"
+    csv_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "test.csv"
+    )
+
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.upper()
+
     return df
 
 # ------------------------------connect to snowflake------------------------------------------------------------------------------
 
 def write_to_snowflake(df):
+    if df.empty:
+        print("No video data to load.")
+        return
 
     conn = snowflake.connector.connect(
         account=os.getenv("SNOWFLAKE_ACCOUNT"),
@@ -158,6 +174,7 @@ def write_to_snowflake(df):
     cursor = conn.cursor()
 
     try:
+        # Create the target table if it does not exist
         cursor.execute("""
         create table if not exists videos(
         video_id varchar,
@@ -171,31 +188,89 @@ def write_to_snowflake(df):
         
         print ("Table created sucessfully!")
 
+        # Create a temporary staging table
+
+        cursor.execute("""
+            CREATE OR REPLACE TEMPORARY TABLE VIDEOS_STAGE
+            LIKE VIDEOS
+        """)
+
+
+        # Load this current run's data into the staging table
 
         success, num_chunks, num_rows, output = write_pandas(
             conn=conn,
             df=df,
-            table_name="VIDEOS",
-            database="YOUTUBE_DATA",
-            schema="PUBLIC"
+            table_name="VIDEOS_STAGE",
+            database=os.getenv("SNOWFLAKE_DATABASE"),
+            schema=os.getenv("SNOWFLAKE_SCHEMA")
         )
+        
+        if not success:
+            raise RuntimeError("Failed to load data into staging table.")
+        else:
+            print ("Status of loading data to Stating table:")
+            print("Success:", success)
+            print("Chunks loaded:", num_chunks)
+            print("Rows loaded:", num_rows)
 
-        print("Success:", success)
-        print("Chunks loaded:", num_chunks)
-        print("Rows loaded:", num_rows)
+        #Insert new videos and update existing videos
 
-    
+        cursor.execute("""
+            MERGE INTO VIDEOS AS target
+            USING VIDEOS_STAGE AS source
+                ON target.VIDEO_ID = source.VIDEO_ID
+
+            WHEN MATCHED THEN UPDATE SET
+                target.TITLE = source.TITLE,
+                target.PUBLISHEDAT = source.PUBLISHEDAT,
+                target.DURATION = source.DURATION,
+                target.VIEWCOUNT = source.VIEWCOUNT,
+                target.LIKECOUNT = source.LIKECOUNT,
+                target.COMMENTCOUNT = source.COMMENTCOUNT
+
+            WHEN NOT MATCHED THEN INSERT (
+                VIDEO_ID,
+                TITLE,
+                PUBLISHEDAT,
+                DURATION,
+                VIEWCOUNT,
+                LIKECOUNT,
+                COMMENTCOUNT
+            )
+            VALUES (
+                source.VIDEO_ID,
+                source.TITLE,
+                source.PUBLISHEDAT,
+                source.DURATION,
+                source.VIEWCOUNT,
+                source.LIKECOUNT,
+                source.COMMENTCOUNT
+            )
+        """)
+        print("Incremental load completed successfully!")
+
     finally:
         cursor.close()
         conn.close()
 
         
 if __name__== "__main__":
+    print ("Starting Youtube pipeline..")
+    
     play_list_id = get_playlist_id()
+    print ("Playlist ID retrieved")
+
     video_ids = get_video_ids(play_list_id,api_key, max_results=50)
+    print("Video IDs retrieved:", len(video_ids))
+
     extracted_data = extract_video_data(video_ids)
+    print("Video data extracted:", len(extracted_data))
+
     save_data(extracted_data)
     df = read_data()
-    write_to_snowflake(df)
+    print("CSV loaded into DataFrame:", len(df), "rows")
 
+    write_to_snowflake(df)
+    print("Pipeline finished.")
 
